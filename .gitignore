@@ -1,0 +1,7 @@
+# Build artifacts
+obj/
+*.exe
+*.o
+
+# Claude Code local settings
+.claude/
