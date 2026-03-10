@@ -26,7 +26,8 @@ SRCS := $(SRCDIR)/main.cpp \
         $(SRCDIR)/capture.cpp \
         $(SRCDIR)/normalizer.cpp \
         $(SRCDIR)/uploader.cpp \
-        $(SRCDIR)/teams.cpp
+        $(SRCDIR)/teams.cpp \
+        $(SRCDIR)/transcript_fetcher.cpp
 
 OBJS := $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SRCS))
 

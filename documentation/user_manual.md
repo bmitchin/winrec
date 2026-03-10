@@ -1,6 +1,6 @@
 # winrec User Manual
 
-**Version 1.1 — March 2026**
+**Version 1.2 — March 2026**
 
 ---
 
@@ -17,11 +17,12 @@
 9. [File Locations and Naming](#9-file-locations-and-naming)
 10. [Audio Capture Behaviour](#10-audio-capture-behaviour)
 11. [Upload to Google Drive](#11-upload-to-google-drive)
-12. [Error Notifications](#12-error-notifications)
-13. [Exiting the Application](#13-exiting-the-application)
-14. [Building from Source](#14-building-from-source)
-15. [Known Limitations](#15-known-limitations)
-16. [Security Considerations](#16-security-considerations)
+12. [Transcript Delivery to OneDrive](#12-transcript-delivery-to-onedrive)
+13. [Error Notifications](#13-error-notifications)
+14. [Exiting the Application](#14-exiting-the-application)
+15. [Building from Source](#15-building-from-source)
+16. [Known Limitations](#16-known-limitations)
+17. [Security Considerations](#17-security-considerations)
 
 ---
 
@@ -435,7 +436,39 @@ rclone move "C:\winrec\out\<filename>.wav" gdrive:teams-audio/
 
 ---
 
-## 12. Error Notifications
+## 12. Transcript Delivery to OneDrive
+
+After a recording is uploaded and the Linux transcription app processes it, the resulting `.txt` transcript is uploaded back to `gdrive:teams-audio/`. winrec picks it up automatically and delivers it to your OneDrive.
+
+### 12.1 How it works
+
+A background thread checks `gdrive:teams-audio/` for `.txt` files every 60 seconds. The first check runs immediately at startup. When transcript files are found, winrec copies them to:
+
+```
+C:\Users\jmitchiner\OneDrive - Pomeroy\Brian@Home\winrec\transcripts
+```
+
+This folder is created automatically if it does not exist. OneDrive then syncs the files to the cloud within seconds, making them available to Microsoft Copilot.
+
+### 12.2 Balloon notification
+
+When transcripts are successfully copied, winrec shows:
+
+> **winrec** — *Transcript(s) moved to OneDrive.*
+
+If the rclone copy fails, no balloon is shown — check `rclone_log.txt` for details.
+
+### 12.3 Files remain on Google Drive
+
+The current implementation uses `rclone copy` (not `rclone move`), so originals remain on `gdrive:teams-audio/` after delivery. This is intentional while the pipeline is being verified. Once confirmed working, the source will be switched to `rclone move` to clean up Drive automatically.
+
+### 12.4 End-of-day workflow with Copilot
+
+Once transcripts are in OneDrive, Microsoft Copilot can reference them alongside your Teams messages, emails, and calendar to generate an end-of-day summary — what was accomplished, what is outstanding, and where to pick up tomorrow.
+
+---
+
+## 13. Error Notifications
 
 winrec communicates all errors and status changes via Windows balloon notifications.
 
@@ -449,6 +482,7 @@ winrec communicates all errors and status changes via Windows balloon notificati
 | *Call ended – stopping recording* | Teams auto-detection stopped recording |
 | *Recording stopped; normalizing…* | Stop accepted; pipeline running |
 | *Upload complete: filename.wav* | Full pipeline succeeded |
+| *Transcript(s) moved to OneDrive.* | .txt files copied from Drive to OneDrive sync folder |
 | *Drive auth expired — browser opening to re-authorize* | rclone OAuth token empty; reconnect starting |
 | *Re-authorized. Retrying upload…* | Reconnect succeeded; upload retrying |
 | *Upload failed. WAV kept in out\ folder* | rclone failed; file kept for manual retry |
@@ -463,7 +497,7 @@ Windows may suppress balloon notifications if you are in full-screen mode or Do 
 
 ---
 
-## 13. Exiting the Application
+## 14. Exiting the Application
 
 ### Normal exit
 
@@ -485,7 +519,7 @@ winrec will then launch silently at logon and sit idle in the tray until a recor
 
 ---
 
-## 14. Building from Source
+## 15. Building from Source
 
 winrec is written in C++17 and cross-compiled on Linux using MinGW-w64.
 
@@ -525,6 +559,7 @@ winrec/
         normalizer.cpp  — two-pass resample + normalize, WAV header writer
         uploader.cpp    — rclone.exe invocation with OAuth auto-reconnect retry loop
         teams.cpp       — Teams Third-Party App API WebSocket monitor
+        transcript_fetcher.cpp — polls gdrive for .txt files, copies to OneDrive
     documentation/
         winrec_design_doc.md
         quickstart.md
@@ -546,7 +581,7 @@ Linked libraries: `ole32`, `oleaut32`, `uuid`, `shell32`, `user32`, `comctl32`, 
 
 ---
 
-## 15. Known Limitations
+## 16. Known Limitations
 
 **Stereo Mix / loopback device required for call audio.** Without a Stereo Mix recording device enabled in Windows for the active playback endpoint, call participants' audio cannot be captured. Laptop speakers typically expose Stereo Mix; USB and Bluetooth headsets typically do not.
 
@@ -566,7 +601,7 @@ Linked libraries: `ole32`, `oleaut32`, `uuid`, `shell32`, `user32`, `comctl32`, 
 
 ---
 
-## 16. Security Considerations
+## 17. Security Considerations
 
 **rclone configuration file.** The file `%APPDATA%\Roaming\rclone\rclone.conf` contains OAuth refresh tokens that grant write access to your Google Drive. Protect it:
 

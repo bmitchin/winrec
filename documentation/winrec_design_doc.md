@@ -1,6 +1,6 @@
 # winrec — Design Document
 
-**Version 1.1 — March 2026**
+**Version 1.2 — March 2026**
 
 This document describes the architecture, data flows, and key design decisions for winrec as actually implemented. It supersedes the original brief-form spec.
 
@@ -16,13 +16,14 @@ This document describes the architecture, data flows, and key design decisions f
 6. [Component: Normalizer (normalizer.cpp)](#6-component-normalizer-normalizercpp)
 7. [Component: Uploader (uploader.cpp)](#7-component-uploader-uploadercpp)
 8. [Component: Teams Monitor (teams.cpp)](#8-component-teams-monitor-teamscpp)
-9. [Component: Main / State Coordinator (main.cpp)](#9-component-main--state-coordinator-maincpp)
-10. [Message Protocol](#10-message-protocol)
-11. [File Layout and Naming](#11-file-layout-and-naming)
-12. [Audio Capture Details](#12-audio-capture-details)
-13. [Build System](#13-build-system)
-14. [Key Design Decisions](#14-key-design-decisions)
-15. [Known Issues and Limitations](#15-known-issues-and-limitations)
+9. [Component: Transcript Fetcher (transcript_fetcher.cpp)](#9-component-transcript-fetcher-transcript_fetchercpp)
+10. [Component: Main / State Coordinator (main.cpp)](#10-component-main--state-coordinator-maincpp)
+11. [Message Protocol](#11-message-protocol)
+12. [File Layout and Naming](#12-file-layout-and-naming)
+13. [Audio Capture Details](#13-audio-capture-details)
+14. [Build System](#14-build-system)
+15. [Key Design Decisions](#15-key-design-decisions)
+16. [Known Issues and Limitations](#16-known-issues-and-limitations)
 
 ---
 
@@ -75,6 +76,13 @@ winrec is a single-process, message-driven application. All state transitions ha
 │ Teams Monitor Thread (teams.cpp)                              │
 │                                                               │
 │ WebSocket → localhost:8124  →  WM_APP_TEAMS_CALL_START/END   │
+└───────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────┐
+│ Transcript Fetcher Thread (transcript_fetcher.cpp)            │
+│                                                               │
+│ rclone ls/copy gdrive:teams-audio/*.txt  →  OneDrive folder  │
+│                              →  WM_APP_TRANSCRIPT_FETCHED     │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -380,7 +388,51 @@ All connection events are written to `winrec_teams_log.txt` in the exe directory
 
 ---
 
-## 9. Component: Main / State Coordinator (main.cpp)
+## 9. Component: Transcript Fetcher (transcript_fetcher.cpp)
+
+### Responsibility
+
+Runs in a persistent background thread for the entire lifetime of the application. Every 60 seconds it checks `gdrive:teams-audio/` for `.txt` transcript files produced by the Linux transcription app, copies them to the local OneDrive sync folder, and posts `WM_APP_TRANSCRIPT_FETCHED` to notify the main window.
+
+### Public API
+
+```cpp
+void TranscriptFetcherStart(HWND hwnd);
+void TranscriptFetcherStop();
+```
+
+### Motivation
+
+The Linux transcription app downloads WAV files from `gdrive:teams-audio/`, transcribes them, and uploads the resulting `.txt` file back to the same folder via `rclone copy`. The transcript fetcher closes this loop by retrieving those `.txt` files and depositing them in the OneDrive sync folder so Microsoft Copilot can index them for end-of-day summaries.
+
+### Destination path
+
+```
+C:\Users\jmitchiner\OneDrive - Pomeroy\Brian@Home\winrec\transcripts
+```
+
+The folder is created with `CreateDirectoryW` on the first check cycle (no-op if it already exists).
+
+### Check cycle
+
+On each cycle (and immediately at startup — the wait occurs at the *end* of the loop):
+
+1. **List:** run `rclone ls --include "*.txt" gdrive:teams-audio/` with stdout captured via a pipe.
+2. **Bail early:** if output is empty, skip to the wait — no rclone copy invoked.
+3. **Copy:** run `rclone copy --include "*.txt" gdrive:teams-audio/ "<dest>"`. Files remain on Drive until the pipeline is confirmed working; change `copy` to `move` when ready.
+4. **Notify:** post `WM_APP_TRANSCRIPT_FETCHED` with `wParam=1` on success, `wParam=0` on rclone error.
+
+### Stop mechanism
+
+Uses a manual-reset Windows Event (`CreateEventW`). `WaitForSingleObject(hStopEvent, 60000)` is used as the sleep so the thread wakes immediately when `TranscriptFetcherStop()` sets the event, rather than sleeping the full minute.
+
+### Error handling
+
+If `rclone.exe` is not found next to `winrec.exe`, `CreateProcessW` fails silently each cycle. The thread continues running — no crash, no user disruption, no interference with recording.
+
+---
+
+## 10. Component: Main / State Coordinator (main.cpp)
 
 ### Responsibility
 
@@ -436,6 +488,7 @@ g_exeDir = GetExeDir();
 g_app.state = RecorderState::Idle;
 TrayAdd(g_app.hwnd);
 TeamsMonitorStart(g_app.hwnd);
+TranscriptFetcherStart(g_app.hwnd);
 // Enter message loop
 ```
 
@@ -448,12 +501,13 @@ TrayRemove();
 PostQuitMessage(0);
 // After message loop:
 TeamsMonitorStop();
+TranscriptFetcherStop();
 CoUninitialize();
 ```
 
 ---
 
-## 10. Message Protocol
+## 11. Message Protocol
 
 All inter-thread communication goes through `PostMessageW` to the main hidden window.
 
@@ -465,12 +519,13 @@ All inter-thread communication goes through `PostMessageW` to the main hidden wi
 | `WM_APP_UPLOAD_DONE` | `WM_USER+4` | uploader thread | 0=ok, 1=err | Upload complete |
 | `WM_APP_TEAMS_CALL_START` | `WM_USER+5` | Teams monitor thread | — | Call/meeting joined |
 | `WM_APP_TEAMS_CALL_END` | `WM_USER+6` | Teams monitor thread | — | Call/meeting left |
+| `WM_APP_TRANSCRIPT_FETCHED` | `WM_USER+7` | Transcript fetcher thread | 1=ok, 0=err | .txt files copied to OneDrive |
 
 Using `PostMessageW` (not `SendMessageW`) ensures background threads never block on the main thread.
 
 ---
 
-## 11. File Layout and Naming
+## 12. File Layout and Naming
 
 ### Runtime files
 
@@ -500,7 +555,7 @@ Colons are excluded from filenames because Windows does not allow them in paths.
 
 ---
 
-## 12. Audio Capture Details
+## 13. Audio Capture Details
 
 ### WASAPI path — format handling
 
@@ -536,7 +591,7 @@ A simple circular buffer of `int16_t` samples, protected by a `CRITICAL_SECTION`
 
 ---
 
-## 13. Build System
+## 14. Build System
 
 ### Makefile
 
@@ -555,7 +610,8 @@ LIBS := -lole32 -loleaut32 -luuid \
         -lmmdevapi -lwinmm -lwinhttp
 
 SRCS := src/main.cpp src/tray.cpp src/capture.cpp \
-        src/normalizer.cpp src/uploader.cpp src/teams.cpp
+        src/normalizer.cpp src/uploader.cpp src/teams.cpp \
+        src/transcript_fetcher.cpp
 ```
 
 ### Library requirements
@@ -581,7 +637,7 @@ Output: `winrec.exe` in the project root.
 
 ---
 
-## 14. Key Design Decisions
+## 15. Key Design Decisions
 
 ### No main window
 
@@ -613,7 +669,7 @@ The token is generated once with `CoCreateGuid` and saved to `winrec_teams_token
 
 ---
 
-## 15. Known Issues and Limitations
+## 16. Known Issues and Limitations
 
 | Issue | Detail |
 |---|---|

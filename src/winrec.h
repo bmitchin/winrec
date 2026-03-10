@@ -8,12 +8,13 @@
 #include <string>
 #include <atomic>
 #include <cstdint>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // Application state
 // ---------------------------------------------------------------------------
 
-enum class RecorderState { Idle, Recording, Normalizing, Uploading };
+enum class RecorderState { Idle, Recording, Normalizing, Uploading, Error };
 
 struct AppState {
     HWND            hwnd;
@@ -23,6 +24,20 @@ struct AppState {
     std::wstring    rawPath;   // temp .pcm
     std::wstring    tmpPath;   // temp resampled float .tmp
     std::wstring    outPath;   // final .wav
+};
+
+// ---------------------------------------------------------------------------
+// Split recording support
+// ---------------------------------------------------------------------------
+
+constexpr int SPLIT_INTERVAL_SECONDS = 2100;  // ~35 min per chunk
+
+struct SplitChunk {
+    std::wstring rawPath;
+    std::wstring tmpPath;
+    std::wstring outPath;
+    SYSTEMTIME   startTime;
+    SYSTEMTIME   endTime;
 };
 
 extern AppState g_app;
@@ -38,8 +53,10 @@ extern std::wstring g_exeDir;
 #define WM_APP_UPLOAD_DONE       (WM_USER + 4)   // posted by uploader thread when done
 // wParam for WM_APP_*_DONE: 0 = success, 1 = error
 
-#define WM_APP_TEAMS_CALL_START  (WM_USER + 5)   // Teams call detected
-#define WM_APP_TEAMS_CALL_END    (WM_USER + 6)   // Teams call ended
+#define WM_APP_TEAMS_CALL_START   (WM_USER + 5)   // Teams call detected
+#define WM_APP_TEAMS_CALL_END     (WM_USER + 6)   // Teams call ended
+#define WM_APP_TRANSCRIPT_FETCHED (WM_USER + 7)   // transcript fetcher moved .txt files
+// wParam for WM_APP_TRANSCRIPT_FETCHED: 1 = files moved, 0 = rclone error
 
 // Menu IDs
 #define IDM_START  1001
@@ -107,5 +124,13 @@ void EnsureDirectory(const std::wstring& path);
 // Teams monitor
 // ---------------------------------------------------------------------------
 
-void TeamsMonitorStart(HWND hwnd);
-void TeamsMonitorStop();
+void            TeamsMonitorStart(HWND hwnd);
+void            TeamsMonitorStop();
+const wchar_t*  TeamsGetMeetingName();
+
+// ---------------------------------------------------------------------------
+// Transcript fetcher
+// ---------------------------------------------------------------------------
+
+void TranscriptFetcherStart(HWND hwnd);
+void TranscriptFetcherStop();
