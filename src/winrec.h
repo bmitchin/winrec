@@ -55,8 +55,6 @@ extern std::wstring g_exeDir;
 
 #define WM_APP_TEAMS_CALL_START   (WM_USER + 5)   // Teams call detected
 #define WM_APP_TEAMS_CALL_END     (WM_USER + 6)   // Teams call ended
-#define WM_APP_TRANSCRIPT_FETCHED (WM_USER + 7)   // transcript fetcher moved .txt files
-// wParam for WM_APP_TRANSCRIPT_FETCHED: 1 = files moved, 0 = rclone error
 
 // Menu IDs
 #define IDM_START  1001
@@ -93,7 +91,6 @@ extern int  g_numLoops;
 
 struct NormParams {
     std::wstring rawPath;
-    std::wstring tmpPath;
     std::wstring outPath;
     UINT32       inputRate;   // sample rate of raw PCM
     HWND         hwnd;
@@ -128,9 +125,3 @@ void            TeamsMonitorStart(HWND hwnd);
 void            TeamsMonitorStop();
 const wchar_t*  TeamsGetMeetingName();
 
-// ---------------------------------------------------------------------------
-// Transcript fetcher
-// ---------------------------------------------------------------------------
-
-void TranscriptFetcherStart(HWND hwnd);
-void TranscriptFetcherStop();

@@ -3,8 +3,10 @@
 
 static NOTIFYICONDATAW g_nid         = {};
 static bool            g_added       = false;
-static HICON           g_icoIdle     = nullptr;  // sky blue  – not recording
-static HICON           g_icoRecording= nullptr;  // mint green – recording
+static HICON           g_icoIdle      = nullptr;  // sky blue   – not recording
+static HICON           g_icoRecording = nullptr;  // mint green – recording
+static HICON           g_icoBusy      = nullptr;  // amber      – normalizing / uploading
+static HICON           g_icoError     = nullptr;  // red        – error
 
 // ---------------------------------------------------------------------------
 // Draw a filled circle "bubble" icon with a small gloss highlight.
@@ -73,7 +75,13 @@ static HICON MakeBubbleIcon(COLORREF color)
 
 static HICON GetStateIcon(RecorderState state)
 {
-    return (state == RecorderState::Recording) ? g_icoRecording : g_icoIdle;
+    switch (state) {
+    case RecorderState::Recording:   return g_icoRecording;
+    case RecorderState::Normalizing: return g_icoBusy;
+    case RecorderState::Uploading:   return g_icoBusy;
+    case RecorderState::Error:       return g_icoError;
+    default:                         return g_icoIdle;
+    }
 }
 
 static const wchar_t* GetStateTip(RecorderState state)
@@ -83,6 +91,7 @@ static const wchar_t* GetStateTip(RecorderState state)
     case RecorderState::Recording:   return L"winrec – Recording…";
     case RecorderState::Normalizing: return L"winrec – Normalizing…";
     case RecorderState::Uploading:   return L"winrec – Uploading…";
+    case RecorderState::Error:       return L"winrec – Error (click to dismiss)";
     }
     return L"winrec";
 }
@@ -97,6 +106,10 @@ void TrayAdd(HWND hwnd)
         g_icoIdle      = MakeBubbleIcon(RGB(0x87, 0xCE, 0xEB));  // sky blue
     if (!g_icoRecording)
         g_icoRecording = MakeBubbleIcon(RGB(0x3C, 0xD4, 0x82));  // mint green
+    if (!g_icoBusy)
+        g_icoBusy      = MakeBubbleIcon(RGB(0xFF, 0xC3, 0x00));  // amber
+    if (!g_icoError)
+        g_icoError     = MakeBubbleIcon(RGB(0xD4, 0x5A, 0x5A));  // red
 
     g_nid.cbSize           = sizeof(g_nid);
     g_nid.hWnd             = hwnd;

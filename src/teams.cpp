@@ -9,6 +9,7 @@
 static HANDLE            g_teamsThread  = nullptr;
 static std::atomic<bool> g_teamsRunning { false };
 static HWND              g_teamsHwnd    = nullptr;
+static wchar_t           g_meetingName[128] = {};
 
 // ---------------------------------------------------------------------------
 // Debug log — appends timestamped entries to winrec_teams_log.txt
@@ -66,6 +67,151 @@ static std::wstring GetOrCreateToken()
     if (fw) { fwprintf(fw, L"%ls\n", token); fclose(fw); }
 
     return std::wstring(token);
+}
+
+// ---------------------------------------------------------------------------
+// Meeting name — read from Teams window title via EnumWindows
+// ---------------------------------------------------------------------------
+
+// Returns true if the window belongs to the Teams process (ms-teams.exe or Teams.exe).
+// Used as fallback for 1:1 calls where the window title is just the contact name.
+static bool IsTeamsProcess(HWND hwnd, char* outExeName, int outLen)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) {
+        if (outExeName) _snprintf(outExeName, outLen, "(no pid)");
+        return false;
+    }
+
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProc) {
+        if (outExeName) _snprintf(outExeName, outLen, "(OpenProcess failed, pid=%lu)", pid);
+        return false;
+    }
+
+    wchar_t exePath[MAX_PATH] = {};
+    DWORD   size              = MAX_PATH;
+    BOOL    ok = QueryFullProcessImageNameW(hProc, 0, exePath, &size);
+    CloseHandle(hProc);
+    if (!ok) {
+        if (outExeName) _snprintf(outExeName, outLen, "(QueryProcessName failed)");
+        return false;
+    }
+
+    const wchar_t* fname = wcsrchr(exePath, L'\\');
+    fname = fname ? fname + 1 : exePath;
+
+    // Copy narrow version for logging
+    if (outExeName) {
+        int i = 0;
+        while (fname[i] && i < outLen - 1) { outExeName[i] = (char)fname[i]; i++; }
+        outExeName[i] = '\0';
+    }
+
+    return _wcsicmp(fname, L"ms-teams.exe") == 0 ||
+           _wcsicmp(fname, L"Teams.exe")    == 0;
+}
+
+struct FindTeamsCtx {
+    wchar_t result[128];
+};
+
+static BOOL CALLBACK FindTeamsWindowCb(HWND hwnd, LPARAM lParam)
+{
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    wchar_t title[512] = {};
+    if (!GetWindowTextW(hwnd, title, _countof(title)) || !title[0]) return TRUE;
+
+    auto* ctx = reinterpret_cast<FindTeamsCtx*>(lParam);
+
+    // Log every visible window with a non-empty title
+    TeamsLog("  [enum] hwnd=%p title=\"%ls\"", (void*)hwnd, title);
+
+    // Format 1: "Meeting Name | [Org | email | ] Microsoft Teams"
+    // The title can contain extra segments: take only the first one.
+    const wchar_t* sep = wcsstr(title, L" | Microsoft Teams");
+    if (sep && sep != title) {
+        size_t len = (size_t)(sep - title);
+        if (len > 60) len = 60;
+        wcsncpy(ctx->result, title, len);
+        ctx->result[len] = L'\0';
+        // Strip any additional " | org | email" segments from what we extracted
+        wchar_t* extraPipe = wcsstr(ctx->result, L" | ");
+        if (extraPipe) *extraPipe = L'\0';
+        TeamsLog("  [enum] -> matched Format1 (| Microsoft Teams), raw=\"%ls\"", ctx->result);
+        return FALSE;
+    }
+
+    // Format 2: "Microsoft Teams – Meeting Name" or "Microsoft Teams - Meeting Name"
+    const wchar_t* prefixes[] = { L"Microsoft Teams \u2013 ", L"Microsoft Teams - ", nullptr };
+    for (int i = 0; prefixes[i]; ++i) {
+        size_t plen = wcslen(prefixes[i]);
+        if (wcsncmp(title, prefixes[i], plen) == 0) {
+            wcsncpy(ctx->result, title + plen, 60);
+            ctx->result[60] = L'\0';
+            TeamsLog("  [enum] -> matched Format2 (prefix), raw=\"%ls\"", ctx->result);
+            return FALSE;
+        }
+    }
+
+    // Skip the generic home-screen title
+    if (wcscmp(title, L"Microsoft Teams") == 0) {
+        TeamsLog("  [enum] -> skipped (generic 'Microsoft Teams' title)");
+        return TRUE;
+    }
+
+    // Fallback: check if it's a Teams process window
+    char exeName[64] = {};
+    bool isTeams = IsTeamsProcess(hwnd, exeName, sizeof(exeName));
+    TeamsLog("  [enum] -> process=%s isTeams=%s", exeName, isTeams ? "YES" : "no");
+
+    if (isTeams) {
+        wcsncpy(ctx->result, title, 60);
+        ctx->result[60] = L'\0';
+        TeamsLog("  [enum] -> matched Fallback (Teams process), raw=\"%ls\"", ctx->result);
+        return FALSE;
+    }
+
+    return TRUE;  // keep looking
+}
+
+static void CaptureMeetingName()
+{
+    TeamsLog("CaptureMeetingName: starting EnumWindows");
+
+    FindTeamsCtx ctx = {};
+    EnumWindows(FindTeamsWindowCb, reinterpret_cast<LPARAM>(&ctx));
+
+    TeamsLog("CaptureMeetingName: EnumWindows done, raw=\"%ls\"", ctx.result);
+
+    // Sanitize: limit length, replace illegal/space chars with _, collapse runs
+    std::wstring s(ctx.result);
+    if (s.size() > 60) s.resize(60);
+
+    std::wstring result;
+    bool prevUnderscore = false;
+    for (wchar_t c : s) {
+        wchar_t out = c;
+        if (c == L' ' || c == L'<' || c == L'>' || c == L':' ||
+            c == L'"' || c == L'/' || c == L'\\' || c == L'|' ||
+            c == L'?' || c == L'*') {
+            out = L'_';
+        }
+        if (out == L'_') {
+            if (!prevUnderscore) result += out;
+            prevUnderscore = true;
+        } else {
+            result += out;
+            prevUnderscore = false;
+        }
+    }
+    while (!result.empty() && result.front() == L'_') result.erase(result.begin());
+    while (!result.empty() && result.back()  == L'_') result.pop_back();
+
+    wcsncpy(g_meetingName, result.c_str(), 127);
+    g_meetingName[127] = L'\0';
+    TeamsLog("CaptureMeetingName: final=\"%ls\" (%d chars)", g_meetingName, (int)wcslen(g_meetingName));
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +341,7 @@ static DWORD WINAPI TeamsMonitorThread(LPVOID)
 
             if (IsInMeeting(buf) && !wasInMeeting) {
                 wasInMeeting = true;
+                CaptureMeetingName();
                 TeamsLog(">>> isInMeeting=true — posting CALL_START");
                 PostMessageW(g_teamsHwnd, WM_APP_TEAMS_CALL_START, 0, 0);
             } else if (IsNotInMeeting(buf) && wasInMeeting) {
@@ -229,6 +376,11 @@ void TeamsMonitorStart(HWND hwnd)
     g_teamsHwnd = hwnd;
     g_teamsRunning.store(true);
     g_teamsThread = CreateThread(nullptr, 0, TeamsMonitorThread, nullptr, 0, nullptr);
+}
+
+const wchar_t* TeamsGetMeetingName()
+{
+    return g_meetingName;
 }
 
 void TeamsMonitorStop()

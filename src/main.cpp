@@ -87,7 +87,7 @@ static void StartRecording()
 
     g_app.rawPath = tmpDir + L"\\raw_" + ts + L".pcm";
     g_app.tmpPath = tmpDir + L"\\raw_" + ts + L".tmp";
-    g_app.outPath = L"";  // filled on stop (manual) or per-chunk (Teams)
+    g_app.outPath = L"";  // filled per-chunk on stop
 
     std::wstring captureErr = CaptureStart(g_app.rawPath, g_app.startTime);
     if (!captureErr.empty()) {
@@ -119,18 +119,37 @@ static void StartRecording()
     _snwprintf(msg, _countof(msg), L"Recording started at %02d:%02d",
                g_app.startTime.wHour, g_app.startTime.wMinute);
     TrayBalloon(L"winrec", msg);
+
+    g_pendingSplit    = false;
+    g_teamsCallEnding = false;
+    g_chunks.clear();
+    SetTimer(g_app.hwnd, SPLIT_TIMER_ID, SPLIT_INTERVAL_SECONDS * 1000, nullptr);
 }
 
 static void StopRecording()
 {
     if (g_app.state != RecorderState::Recording) return;
-    GetLocalTime(&g_app.endTime);
 
-    std::wstring startStr = FormatTimestamp(g_app.startTime);
-    std::wstring endStr   = FormatTimestamp(g_app.endTime);
-    std::wstring outDir   = g_exeDir + L"\\out";
-    g_app.outPath = outDir + L"\\" + startStr + L"-" + endStr + L".wav";
+    KillTimer(g_app.hwnd, SPLIT_TIMER_ID);
 
+    if (g_pendingSplit) {
+        // Split already in flight; OnRecordingDone will finish the batch
+        g_teamsCallEnding = true;
+        return;
+    }
+
+    SYSTEMTIME endTime;
+    GetLocalTime(&endTime);
+
+    SplitChunk chunk;
+    chunk.rawPath   = g_app.rawPath;
+    chunk.tmpPath   = g_app.tmpPath;
+    chunk.startTime = g_app.startTime;
+    chunk.endTime   = endTime;
+    chunk.outPath   = ComputeChunkOutPath(chunk.startTime, chunk.endTime);
+    g_chunks.push_back(chunk);
+
+    g_teamsCallEnding = true;
     CaptureStop();  // async; WM_APP_RECORDING_DONE will be posted when thread exits
     TrayBalloon(L"winrec", L"Recording stopped; normalizing…");
 }
@@ -185,25 +204,6 @@ static void OnRecordingDone(bool ok)
         return;
     }
 
-    // --- Manual recording: normalise immediately ---
-    g_app.state = RecorderState::Normalizing;
-    TrayUpdate(RecorderState::Normalizing);
-
-    extern UINT32 g_captureInputRate;
-
-    auto* p = new NormParams{
-        g_app.rawPath,
-        g_app.tmpPath,
-        g_app.outPath,
-        g_captureInputRate,
-        g_app.hwnd
-    };
-    HANDLE h = CreateThread(nullptr, 0, NormalizerThread, p, 0, nullptr);
-    if (h) CloseHandle(h);
-    else {
-        delete p;
-        EnterError(L"Failed to start normalizer thread.");
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +221,7 @@ static void StartBatchNormalize()
     extern UINT32 g_captureInputRate;
     auto& chunk = g_chunks[0];
     auto* p = new NormParams{
-        chunk.rawPath, chunk.tmpPath, chunk.outPath,
+        chunk.rawPath, chunk.outPath,
         g_captureInputRate, g_app.hwnd
     };
     HANDLE h = CreateThread(nullptr, 0, NormalizerThread, p, 0, nullptr);
@@ -240,15 +240,15 @@ static void OnNormDone(bool ok)
         return;
     }
 
-    // --- Batch mode: normalise next chunk, or start upload batch ---
-    if (g_isTeamsCall && !g_chunks.empty()) {
+    // --- Normalise next chunk, or start upload batch ---
+    if (!g_chunks.empty()) {
         g_normChunkIdx++;
         if (g_normChunkIdx < (int)g_chunks.size()) {
             // Normalise next chunk
             extern UINT32 g_captureInputRate;
             auto& chunk = g_chunks[g_normChunkIdx];
             auto* p = new NormParams{
-                chunk.rawPath, chunk.tmpPath, chunk.outPath,
+                chunk.rawPath, chunk.outPath,
                 g_captureInputRate, g_app.hwnd
             };
             HANDLE h = CreateThread(nullptr, 0, NormalizerThread, p, 0, nullptr);
@@ -268,22 +268,6 @@ static void OnNormDone(bool ok)
         HANDLE h = CreateThread(nullptr, 0, UploaderThread, p, 0, nullptr);
         if (h) CloseHandle(h);
         else { delete p; EnterError(L"Failed to start uploader thread."); }
-        return;
-    }
-
-    // --- Manual recording: upload immediately ---
-    g_app.state = RecorderState::Uploading;
-    TrayUpdate(RecorderState::Uploading);
-
-    std::wstring rclonePath = g_exeDir + L"\\rclone.exe";
-    auto* p = new UploadParams{
-        g_app.outPath, rclonePath, L"gdrive:teams-audio/", g_app.hwnd
-    };
-    HANDLE h = CreateThread(nullptr, 0, UploaderThread, p, 0, nullptr);
-    if (h) CloseHandle(h);
-    else {
-        delete p;
-        EnterError(L"Failed to start uploader thread.");
     }
 }
 
@@ -293,8 +277,7 @@ static void OnNormDone(bool ok)
 
 static void OnUploadDone(bool ok)
 {
-    // --- Batch mode ---
-    if (g_isTeamsCall && !g_chunks.empty()) {
+    if (!g_chunks.empty()) {
         if (!ok) {
             EnterError(L"Upload failed. WAV kept in out\\ folder.");
             return;
@@ -322,19 +305,6 @@ static void OnUploadDone(bool ok)
         g_callMeetingName.clear();
         g_chunks.clear();
         EnterIdle();
-        return;
-    }
-
-    // --- Manual recording ---
-    if (ok) {
-        auto pos = g_app.outPath.find_last_of(L"\\/");
-        std::wstring name = (pos != std::wstring::npos)
-                            ? g_app.outPath.substr(pos + 1)
-                            : g_app.outPath;
-        TrayBalloon(L"winrec", (L"Upload complete: " + name).c_str());
-        EnterIdle();
-    } else {
-        EnterError(L"Upload failed. WAV kept in out\\ folder.");
     }
 }
 
@@ -378,7 +348,7 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
 
     case WM_TIMER:
         if ((UINT_PTR)wParam == SPLIT_TIMER_ID &&
-            g_isTeamsCall && g_app.state == RecorderState::Recording) {
+            g_app.state == RecorderState::Recording) {
             // Save current chunk, then restart capture
             SYSTEMTIME endTime;
             GetLocalTime(&endTime);
@@ -420,21 +390,12 @@ static LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
         OnUploadDone(wParam == 0);
         return 0;
 
-    case WM_APP_TRANSCRIPT_FETCHED:
-        if (wParam > 0)
-            TrayBalloon(L"winrec", L"Transcript(s) moved to OneDrive.");
-        return 0;
-
     case WM_APP_TEAMS_CALL_START:
         if (g_app.state == RecorderState::Idle) {
             g_callMeetingName = TeamsGetMeetingName();  // snapshot before thread clears it
             g_isTeamsCall     = true;
-            g_pendingSplit    = false;
-            g_teamsCallEnding = false;
-            g_chunks.clear();
             TrayBalloon(L"winrec – Teams", L"Call detected – recording started automatically.");
             StartRecording();
-            SetTimer(hwnd, SPLIT_TIMER_ID, SPLIT_INTERVAL_SECONDS * 1000, nullptr);
         }
         return 0;
 
@@ -499,7 +460,6 @@ int WINAPI WinMainImpl()
     g_app.state = RecorderState::Idle;
     TrayAdd(g_app.hwnd);
     TeamsMonitorStart(g_app.hwnd);
-    TranscriptFetcherStart(g_app.hwnd);
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -508,7 +468,6 @@ int WINAPI WinMainImpl()
     }
 
     TeamsMonitorStop();
-    TranscriptFetcherStop();
     CoUninitialize();
     return (int)msg.wParam;
 }

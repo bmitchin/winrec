@@ -2,6 +2,10 @@
 obj/
 *.exe
 *.o
+19
+
+# Runtime logs
+*_log.txt
 
 # Claude Code local settings
 .claude/
