@@ -1,6 +1,6 @@
 # winrec User Manual
 
-**Version 1.2 — March 2026**
+**Version 1.3 — June 2026**
 
 ---
 
@@ -17,12 +17,11 @@
 9. [File Locations and Naming](#9-file-locations-and-naming)
 10. [Audio Capture Behaviour](#10-audio-capture-behaviour)
 11. [Upload to Google Drive](#11-upload-to-google-drive)
-12. [Transcript Delivery to OneDrive](#12-transcript-delivery-to-onedrive)
-13. [Error Notifications](#13-error-notifications)
-14. [Exiting the Application](#14-exiting-the-application)
-15. [Building from Source](#15-building-from-source)
-16. [Known Limitations](#16-known-limitations)
-17. [Security Considerations](#17-security-considerations)
+12. [Error Notifications](#12-error-notifications)
+13. [Exiting the Application](#13-exiting-the-application)
+14. [Building from Source](#14-building-from-source)
+15. [Known Limitations](#15-known-limitations)
+16. [Security Considerations](#16-security-considerations)
 
 ---
 
@@ -35,9 +34,9 @@ It captures two audio streams simultaneously:
 - **System output (loopback):** everything you hear through your speakers — remote participants, shared media, system sounds.
 - **Microphone:** your own voice.
 
-The two streams are mixed together in real time into a single mono track, then — after you stop the recording — normalized and resampled to **16 kHz mono 16-bit PCM WAV**. This format is compact and directly accepted by speech-to-text services (Whisper, Google STT, Azure STT, etc.).
+The two streams are mixed together in real time into a single mono track, then — after you stop the recording — resampled to **16 kHz mono 16-bit PCM WAV**. This format is compact and directly accepted by speech-to-text services (Whisper, Google STT, Azure STT, etc.).
 
-After normalization, winrec calls `rclone.exe` to move the finished file to `gdrive:teams-audio/` and then returns to idle.
+After resampling, winrec calls `rclone.exe` to move the finished file(s) to `gdrive:teams-audio/` and then returns to idle. Long sessions are split automatically into ~35-minute files, and Teams calls are tagged with the meeting name in the filename (see §9).
 
 **Teams auto-detection:** winrec can connect to the Microsoft Teams Third-Party App API and automatically start recording when you join a call and stop when you leave. No manual clicks required.
 
@@ -77,7 +76,7 @@ C:\winrec\
     winrec.exe
     rclone.exe
     tmp\          ← created automatically (raw in-progress recordings)
-    out\          ← created automatically (normalized WAVs awaiting upload)
+    out\          ← created automatically (16 kHz WAVs awaiting upload)
 ```
 
 ---
@@ -149,16 +148,20 @@ Windows Settings → Personalization → Taskbar → Other system tray icons →
 |---|---|---|
 | Idle | Sky blue | winrec – Idle (click to start) |
 | Recording | Mint green | winrec – Recording… |
-| Normalizing | Mint green | winrec – Normalizing… |
-| Uploading | Mint green | winrec – Uploading… |
+| Normalizing | Amber | winrec – Normalizing… |
+| Uploading | Amber | winrec – Uploading… |
+| Error | Red | winrec – Error (click to dismiss) |
+
+The icon turns **amber** while winrec is resampling and uploading after a recording, and **red** if something fails (see §12).
 
 ### 5.3 Left-click behaviour
 
 | Current state | Result |
 |---|---|
 | Idle | Starts recording |
-| Recording | Stops recording and begins normalization |
+| Recording | Stops recording and begins processing |
 | Normalizing / Uploading | No action (click is ignored) |
+| Error | Dismisses the error and returns to Idle |
 
 ### 5.4 Right-click context menu
 
@@ -234,37 +237,35 @@ winrec writes connection events to `winrec_teams_log.txt` in the exe folder. Che
 
 ## 8. Post-Recording Pipeline
 
-After stopping, winrec runs three automatic steps without any user action required.
+After stopping, winrec runs through resampling and upload automatically, with no user action required.
 
-### 8.1 Normalization and resampling (Normalizing state)
+### 8.0 Chunking of long recordings
 
-The raw PCM file (16-bit mono at the device's native sample rate, typically 48 kHz) is processed in two passes:
+While recording, winrec closes the current capture and starts a fresh one every **~35 minutes**. Each segment becomes its own chunk that is processed and uploaded separately. A one-hour call therefore produces two files; a 90-minute call produces three. This bounds the size of each WAV and keeps a long meeting recoverable as discrete uploads even if one transfer fails. Chunks are processed one at a time: each is resampled, then uploaded, before the next is resampled.
 
-**Pass 1 — Resample and scan for peak:**
-- Each output sample at 16 kHz is computed from surrounding input samples using linear interpolation.
-- The maximum absolute sample value (peak) across the entire file is tracked.
-- Resampled float data is written to a temporary `.tmp` file.
+### 8.1 Resampling (Normalizing state)
 
-**Pass 2 — Apply gain and write WAV:**
-- Normalization gain: `gain = 0.95 / peak` (5% headroom to avoid hard clipping).
-- If the recording is near silence (peak < 0.000001), gain defaults to 1.0.
-- Each resampled sample is multiplied by gain, clamped to [-1, 1], and converted to 16-bit signed integer.
-- A standard 44-byte PCM WAV header is written at the start of the output file.
+The raw PCM file (16-bit mono at the device's native sample rate, typically 48 kHz) is resampled to 16 kHz in a single pass:
 
-After Pass 2 succeeds:
-- The raw `.pcm` file is deleted.
-- The intermediate `.tmp` file is deleted.
-- The final `.wav` file remains in `out\`.
+- Each output sample at 16 kHz is computed from the two nearest input samples using linear interpolation.
+- The value is clamped to [-1, 1], converted to 16-bit signed integer, and written directly to the output `.wav`.
+- A standard 44-byte PCM WAV header is written at the start of the file (and patched with the final sample count at the end).
+
+No peak normalization or gain adjustment is applied — samples are written at their captured level. (Earlier versions normalized to 95% peak; this was removed in v1.3 because it amplified background noise and slowed processing, and speech-to-text engines handle level variation fine.)
+
+After resampling succeeds, the raw `.pcm` file is deleted and the `.wav` remains in `out\` awaiting upload.
+
+> **Note:** the tray icon turns **amber** during this stage; the state is still named "Normalizing" internally even though no normalization is performed.
 
 ### 8.2 Upload (Uploading state)
 
-winrec calls `rclone.exe move` with the path to the final WAV and the destination `gdrive:teams-audio/`. The `move` command uploads the file and deletes it locally on success.
+For each chunk, winrec calls `rclone.exe move` with the path to the WAV and the destination `gdrive:teams-audio/`. The `move` command uploads the file and deletes it locally on success.
 
 **OAuth auto-reconnect:** If rclone reports an authentication error (empty or expired token), winrec automatically runs `rclone config reconnect gdrive:` in the background, feeding `y` to the "Use web browser?" prompt. A browser window opens for you to re-authorize. After you complete the authorization, winrec retries the upload automatically — no manual CLI steps required.
 
 winrec waits for rclone to exit and checks its exit code:
-- **Exit code 0:** Upload succeeded. Balloon: *Upload complete: filename.wav*. Returns to Idle.
-- **Non-zero exit code:** Upload failed. Balloon: *Upload failed. WAV kept in out\ folder.* The WAV file is kept for manual retry. Returns to Idle.
+- **Exit code 0:** Upload succeeded. Balloon: *Upload complete: filename.wav* (one per chunk). After the last chunk, returns to Idle.
+- **Non-zero exit code:** Upload failed. The tray icon turns **red** and a balloon shows *Upload failed. WAV kept in out\ folder.* The WAV file is kept for manual retry. Left-click the red icon to dismiss back to Idle.
 
 ### 8.3 State flow summary
 
@@ -273,15 +274,15 @@ Idle
  │  (left-click, or Teams call detected)
  ▼
 Recording  ──────────────────────────── raw_YYMMDD_HHMM.pcm written to tmp\
- │  (left-click, or Teams call ended)
+ │  (split every ~35 min into chunks; left-click or Teams call ended = final chunk)
  ▼
-Normalizing ─────────────── resample + normalize → out\YYMMDD_HHMM-YYMMDD_HHMM.wav
- │  (auto)
+Normalizing ─────────────── resample → out\YYMMDD_HHMM-YYMMDD_HHMM[_Meeting].wav   ┐
+ │  (auto)                                                                          │ repeats
+ ▼                                                                                  │ per
+Uploading  ─────────────── rclone move → gdrive:teams-audio/  (reconnect if needed) │ chunk
+ │  (auto)                                                                          ┘
  ▼
-Uploading  ─────────────── rclone move → gdrive:teams-audio/  (reconnect if needed)
- │  (auto)
- ▼
-Idle
+Idle   (after the last chunk uploads)
 ```
 
 ---
@@ -299,10 +300,9 @@ All paths are relative to the folder containing `winrec.exe`.
     winrec_teams_token.txt      ← Teams pairing token (auto-created)
     winrec_teams_log.txt        ← Teams connection log
     tmp\
-        raw_YYMMDD_HHMM.pcm     ← active recording (deleted after normalization)
-        raw_YYMMDD_HHMM.tmp     ← resampled floats (deleted after WAV write)
+        raw_YYMMDD_HHMM.pcm     ← active recording (deleted after resampling)
     out\
-        YYMMDD_HHMM-YYMMDD_HHMM.wav  ← final WAV (deleted after upload)
+        YYMMDD_HHMM-YYMMDD_HHMM[_Meeting].wav  ← final WAV (deleted after upload)
 ```
 
 Under normal operation both `tmp\` and `out\` are empty when winrec is idle.
@@ -325,6 +325,14 @@ Timestamps use local 24-hour time, format `YYMMDD_HHMM`:
 ```
 260308_1430-260308_1512.wav
 ```
+
+**Teams meeting name:** For calls detected via Teams auto-detection, the meeting name is appended after the end timestamp:
+
+```
+260308_1430-260308_1512_Weekly_Team_Sync.wav
+```
+
+The name is read from the Teams window title when the call starts. Spaces and characters that are illegal in filenames (`< > : " / \ | ? *`) are replaced with underscores, and the name is truncated to 60 characters. For 1:1 calls the name is usually the other person's name. Manual recordings (started by clicking the tray icon) have no meeting name and use the plain timestamp form above. When a call is split into multiple chunks, every chunk carries the same meeting name with its own start/end times.
 
 ### 9.3 Manual recovery
 
@@ -380,7 +388,7 @@ mixed = 0.5 × loopback_mono + 0.5 × mic_mono
 
 Multi-channel loopback is downmixed to mono before mixing: `(L + R) / 2`.
 
-The 0.5 weight on each source provides headroom to prevent clipping during the live mix. Actual loudness balance is corrected in the normalization step.
+The 0.5 weight on each source provides headroom to prevent clipping during the live mix. No post-capture gain correction is applied, so set reasonable system and mic levels before recording.
 
 ### 10.5 Raw PCM format
 
@@ -436,39 +444,7 @@ rclone move "C:\winrec\out\<filename>.wav" gdrive:teams-audio/
 
 ---
 
-## 12. Transcript Delivery to OneDrive
-
-After a recording is uploaded and the Linux transcription app processes it, the resulting `.txt` transcript is uploaded back to `gdrive:teams-audio/`. winrec picks it up automatically and delivers it to your OneDrive.
-
-### 12.1 How it works
-
-A background thread checks `gdrive:teams-audio/` for `.txt` files every 60 seconds. The first check runs immediately at startup. When transcript files are found, winrec copies them to:
-
-```
-C:\Users\jmitchiner\OneDrive - Pomeroy\Brian@Home\winrec\transcripts
-```
-
-This folder is created automatically if it does not exist. OneDrive then syncs the files to the cloud within seconds, making them available to Microsoft Copilot.
-
-### 12.2 Balloon notification
-
-When transcripts are successfully copied, winrec shows:
-
-> **winrec** — *Transcript(s) moved to OneDrive.*
-
-If the rclone copy fails, no balloon is shown — check `rclone_log.txt` for details.
-
-### 12.3 Files remain on Google Drive
-
-The current implementation uses `rclone copy` (not `rclone move`), so originals remain on `gdrive:teams-audio/` after delivery. This is intentional while the pipeline is being verified. Once confirmed working, the source will be switched to `rclone move` to clean up Drive automatically.
-
-### 12.4 End-of-day workflow with Copilot
-
-Once transcripts are in OneDrive, Microsoft Copilot can reference them alongside your Teams messages, emails, and calendar to generate an end-of-day summary — what was accomplished, what is outstanding, and where to pick up tomorrow.
-
----
-
-## 13. Error Notifications
+## 12. Error Notifications
 
 winrec communicates all errors and status changes via Windows balloon notifications.
 
@@ -481,14 +457,13 @@ winrec communicates all errors and status changes via Windows balloon notificati
 | *Call detected – recording started automatically* | Teams auto-detection triggered recording |
 | *Call ended – stopping recording* | Teams auto-detection stopped recording |
 | *Recording stopped; normalizing…* | Stop accepted; pipeline running |
-| *Upload complete: filename.wav* | Full pipeline succeeded |
-| *Transcript(s) moved to OneDrive.* | .txt files copied from Drive to OneDrive sync folder |
+| *Upload complete: filename.wav* | A chunk uploaded successfully (one per chunk) |
 | *Drive auth expired — browser opening to re-authorize* | rclone OAuth token empty; reconnect starting |
 | *Re-authorized. Retrying upload…* | Reconnect succeeded; upload retrying |
 | *Upload failed. WAV kept in out\ folder* | rclone failed; file kept for manual retry |
 | *Failed to initialize WASAPI capture* | No audio devices found, or device in exclusive use |
 | *rclone.exe not found next to winrec.exe* | rclone.exe missing from the exe folder |
-| *Normalization failed* | Could not read/write temp or output files |
+| *Normalization failed* | Resampler could not read the raw PCM or write the output WAV |
 | *Capture thread encountered an error* | Disk write failure during recording |
 
 ### Balloon visibility
@@ -497,7 +472,7 @@ Windows may suppress balloon notifications if you are in full-screen mode or Do 
 
 ---
 
-## 14. Exiting the Application
+## 13. Exiting the Application
 
 ### Normal exit
 
@@ -519,7 +494,7 @@ winrec will then launch silently at logon and sit idle in the tray until a recor
 
 ---
 
-## 15. Building from Source
+## 14. Building from Source
 
 winrec is written in C++17 and cross-compiled on Linux using MinGW-w64.
 
@@ -556,10 +531,9 @@ winrec/
         main.cpp        — WinMain, hidden window, state machine, message loop
         tray.cpp        — Shell_NotifyIcon management and balloon notifications
         capture.cpp     — WASAPI loopback + mic capture; WaveIn fallback with multi-loopback
-        normalizer.cpp  — two-pass resample + normalize, WAV header writer
+        normalizer.cpp  — single-pass resampler to 16 kHz, WAV header writer
         uploader.cpp    — rclone.exe invocation with OAuth auto-reconnect retry loop
-        teams.cpp       — Teams Third-Party App API WebSocket monitor
-        transcript_fetcher.cpp — polls gdrive for .txt files, copies to OneDrive
+        teams.cpp       — Teams Third-Party App API WebSocket monitor + meeting-name capture
     documentation/
         winrec_design_doc.md
         quickstart.md
@@ -581,7 +555,7 @@ Linked libraries: `ole32`, `oleaut32`, `uuid`, `shell32`, `user32`, `comctl32`, 
 
 ---
 
-## 16. Known Limitations
+## 15. Known Limitations
 
 **Stereo Mix / loopback device required for call audio.** Without a Stereo Mix recording device enabled in Windows for the active playback endpoint, call participants' audio cannot be captured. Laptop speakers typically expose Stereo Mix; USB and Bluetooth headsets typically do not.
 
@@ -601,7 +575,7 @@ Linked libraries: `ole32`, `oleaut32`, `uuid`, `shell32`, `user32`, `comctl32`, 
 
 ---
 
-## 17. Security Considerations
+## 16. Security Considerations
 
 **rclone configuration file.** The file `%APPDATA%\Roaming\rclone\rclone.conf` contains OAuth refresh tokens that grant write access to your Google Drive. Protect it:
 

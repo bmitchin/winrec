@@ -86,16 +86,18 @@ Double-click `winrec.exe`. A **sky blue bubble** icon appears in the system tray
 
 ### Automatic (Teams calls)
 
-When you join a Teams meeting or call, winrec detects it and starts recording automatically. The icon turns **mint green**. When you leave the call, recording stops, the file is normalized and uploaded, then the icon returns to sky blue.
+When you join a Teams meeting or call, winrec detects it and starts recording automatically. The icon turns **mint green**. When you leave the call, recording stops, the icon turns **amber** while the audio is resampled and uploaded, then returns to sky blue. The output filename includes the Teams meeting name.
 
 ### Manual
 
 **Start:** Left-click the tray icon. The icon turns mint green.
 
-**Stop:** Left-click again. winrec then automatically:
-1. Normalizes and resamples the audio to 16 kHz mono WAV
+**Stop:** Left-click again. winrec then automatically (icon amber during processing):
+1. Resamples the audio to 16 kHz mono WAV
 2. Uploads the file to `gdrive:teams-audio/` via rclone
 3. Returns to Idle (sky blue)
+
+Recordings longer than ~35 minutes are split into multiple files, each uploaded separately.
 
 ---
 
@@ -108,7 +110,8 @@ Right-click the tray icon → **Exit**.
 ## File naming
 
 ```
-260308_1430-260308_1512.wav
+260308_1430-260308_1512_Weekly_Sync.wav
+│      │         │             └─ Teams meeting name (omitted for manual recordings)
 │      │         └─ stop  time (YYMMDD_HHMM)
 │      └─────────── start time
 └────────────────── year 2026

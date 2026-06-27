@@ -1,6 +1,6 @@
 # winrec — Design Document
 
-**Version 1.2 — March 2026**
+**Version 1.3 — June 2026**
 
 This document describes the architecture, data flows, and key design decisions for winrec as actually implemented. It supersedes the original brief-form spec.
 
@@ -16,20 +16,19 @@ This document describes the architecture, data flows, and key design decisions f
 6. [Component: Normalizer (normalizer.cpp)](#6-component-normalizer-normalizercpp)
 7. [Component: Uploader (uploader.cpp)](#7-component-uploader-uploadercpp)
 8. [Component: Teams Monitor (teams.cpp)](#8-component-teams-monitor-teamscpp)
-9. [Component: Transcript Fetcher (transcript_fetcher.cpp)](#9-component-transcript-fetcher-transcript_fetchercpp)
-10. [Component: Main / State Coordinator (main.cpp)](#10-component-main--state-coordinator-maincpp)
-11. [Message Protocol](#11-message-protocol)
-12. [File Layout and Naming](#12-file-layout-and-naming)
-13. [Audio Capture Details](#13-audio-capture-details)
-14. [Build System](#14-build-system)
-15. [Key Design Decisions](#15-key-design-decisions)
-16. [Known Issues and Limitations](#16-known-issues-and-limitations)
+9. [Component: Main / State Coordinator (main.cpp)](#9-component-main--state-coordinator-maincpp)
+10. [Message Protocol](#10-message-protocol)
+11. [File Layout and Naming](#11-file-layout-and-naming)
+12. [Audio Capture Details](#12-audio-capture-details)
+13. [Build System](#13-build-system)
+14. [Key Design Decisions](#14-key-design-decisions)
+15. [Known Issues and Limitations](#15-known-issues-and-limitations)
 
 ---
 
 ## 1. Goals and Constraints
 
-**Goal:** A portable, no-install Win32 C++ tray application that records Microsoft Teams call audio (and any system audio) and uploads a normalized WAV to Google Drive automatically.
+**Goal:** A portable, no-install Win32 C++ tray application that records Microsoft Teams call audio (and any system audio) and uploads a 16 kHz mono WAV to Google Drive automatically. Long recordings are split into ~35-minute chunks, and Teams calls are tagged with the meeting name in the output filename.
 
 **Hard constraints:**
 - No installer — single `winrec.exe` plus `rclone.exe` in the same folder.
@@ -48,7 +47,7 @@ This document describes the architecture, data flows, and key design decisions f
 
 ## 2. Architecture Overview
 
-winrec is a single-process, message-driven application. All state transitions happen on the main thread via Win32 messages. All blocking work (audio capture, normalization, upload) happens on dedicated worker threads that post messages back to the main window on completion.
+winrec is a single-process, message-driven application. All state transitions happen on the main thread via Win32 messages. All blocking work (audio capture, resampling, upload) happens on dedicated worker threads that post messages back to the main window on completion.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -76,13 +75,8 @@ winrec is a single-process, message-driven application. All state transitions ha
 │ Teams Monitor Thread (teams.cpp)                              │
 │                                                               │
 │ WebSocket → localhost:8124  →  WM_APP_TEAMS_CALL_START/END   │
-└───────────────────────────────────────────────────────────────┘
-
-┌───────────────────────────────────────────────────────────────┐
-│ Transcript Fetcher Thread (transcript_fetcher.cpp)            │
-│                                                               │
-│ rclone ls/copy gdrive:teams-audio/*.txt  →  OneDrive folder  │
-│                              →  WM_APP_TRANSCRIPT_FETCHED     │
+│ On CALL_START: EnumWindows scrape of Teams window title      │
+│                → meeting name for output filenames           │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,10 +84,10 @@ winrec is a single-process, message-driven application. All state transitions ha
 
 ## 3. State Machine
 
-The application is always in exactly one of four states:
+The application is always in exactly one of five states:
 
 ```
-enum class RecorderState { Idle, Recording, Normalizing, Uploading };
+enum class RecorderState { Idle, Recording, Normalizing, Uploading, Error };
 ```
 
 ```
@@ -105,19 +99,25 @@ enum class RecorderState { Idle, Recording, Normalizing, Uploading };
                                          left-click /   │        │
                                    Teams CALL_END        │        │
                                                          ▼        │
-                                                  [Normalizing]   │
-                                                         │        │
+                                                  [Normalizing]   │  (per chunk,
+                                                         │        │   repeated)
                                               (auto, thread done) │
                                                          ▼        │
                                                   [Uploading] ────┘
                                              (auto, rclone done)
+
+     any state ── unrecoverable failure ──► [Error] ── click ──► [Idle]
 ```
 
 **Rules:**
 - Only `Idle → Recording` is user-triggered (or Teams-triggered).
 - All subsequent transitions are automatic (thread completion messages).
+- Normalize and upload run once **per chunk**: the state cycles
+  `Normalizing → Uploading` for each chunk in the batch before returning to Idle
+  (see §9 for the chunk pipeline).
 - Clicking in Normalizing or Uploading states is a no-op.
 - Teams call-end only stops recording if state is `Recording` (ignores if already Idle or in pipeline).
+- `Error` is a terminal state surfaced by the red tray icon; a left-click dismisses it back to Idle.
 
 ---
 
@@ -133,14 +133,15 @@ Manages the system tray icon using `Shell_NotifyIcon`. Provides:
 
 ### Icon colors
 
-| State | Color |
-|---|---|
-| Idle | Sky blue |
-| Recording | Mint green |
-| Normalizing | Mint green |
-| Uploading | Mint green |
+| State | Color | RGB |
+|---|---|---|
+| Idle | Sky blue | `0x87CEEB` |
+| Recording | Mint green | `0x3CD482` |
+| Normalizing | Amber | `0xFFC300` |
+| Uploading | Amber | `0xFFC300` |
+| Error | Red | `0xD45A5A` |
 
-Icons are embedded as Win32 resources and selected by state. The tray icon also serves as the sole visual indicator that winrec is running.
+Icons are drawn at runtime by `MakeBubbleIcon(COLORREF)` — a filled circle with a small gloss highlight — and cached, then selected by state. The tray icon also serves as the sole visual indicator that winrec is running.
 
 ### Tray icon interaction
 
@@ -207,35 +208,35 @@ The balloon at recording start reflects the fallback mode and loopback count.
 
 ### Responsibility
 
-Runs in a dedicated thread spawned by `main.cpp` after `WM_APP_RECORDING_DONE`. Reads the raw `.pcm` file, resamples to 16 kHz, normalizes to 95% peak, and writes a standard PCM WAV.
+Runs in a dedicated thread spawned by `main.cpp` (once per chunk). Reads a raw `.pcm` file, resamples it to 16 kHz, and writes a standard PCM WAV.
+
+> **Note:** Despite the file name, this stage no longer applies peak normalization. As of v1.3 it is a single-pass resampler only — see the rationale below. The name is retained to avoid churn in the message protocol and call sites.
 
 ### Parameters
 
 ```cpp
 struct NormParams {
     std::wstring rawPath;    // input: tmp\raw_YYMMDD_HHMM.pcm
-    std::wstring tmpPath;    // intermediate: tmp\raw_YYMMDD_HHMM.tmp (resampled floats)
-    std::wstring outPath;    // output: out\YYMMDD_HHMM-YYMMDD_HHMM.wav
+    std::wstring outPath;    // output: out\YYMMDD_HHMM-YYMMDD_HHMM[_Meeting].wav
     UINT32       inputRate;  // sample rate of rawPath (from g_captureInputRate)
     HWND         hwnd;
 };
 ```
 
-### Two-pass algorithm
+### Single-pass algorithm
 
-**Pass 1 — Resample and find peak:**
+- Open `rawPath` for read and `outPath` for write; emit a placeholder 44-byte RIFF/PCM WAV header (patched at the end with the true sample count).
 - Step ratio: `inputRate / 16000.0`.
-- For each output sample at index `i`, compute input position `i × step`, take the two nearest input samples, linearly interpolate.
-- Track `maxPeak = max(maxPeak, fabsf(sample))`.
-- Write resampled float samples to `tmpPath`.
+- For each output sample at index `i`, compute input position `i × step`, take the two nearest input samples (served from a small rolling input window so memory stays bounded for hour-long files), and linearly interpolate.
+- Clamp the interpolated value to [-1, 1], convert to `int16_t`, and write directly to `outPath` in 8192-sample buffers.
+- After the loop, `rewind` and rewrite the header with the actual output sample count.
 
-**Pass 2 — Apply gain, write WAV:**
-- `gain = (maxPeak > 1e-6) ? 0.95f / maxPeak : 1.0f`
-- Read `tmpPath` float samples, multiply by gain, clamp to [-1, 1], convert to `int16_t`, write to `outPath`.
-- Prepend a 44-byte RIFF/PCM WAV header.
+**No gain stage.** Samples are written at their captured amplitude. The intermediate `.tmp` float file used by the old two-pass design is gone.
+
+**Why drop normalization (v1.3):** the prior two-pass design scanned for the peak, then applied `0.95 / peak` gain. In practice this amplified background noise during quiet calls and added a full second read/write pass over multi-hundred-MB files. Speech-to-text engines (Whisper, Google/Azure STT) are robust to moderate level variation, so the gain stage was removed in favor of a faster single pass and a smaller memory/disk footprint.
 
 **Cleanup:**
-- Delete `rawPath` and `tmpPath` on success.
+- Delete `rawPath` on success.
 - Post `WM_APP_NORM_DONE` (wParam=0 success, 1 error).
 
 ---
@@ -373,6 +374,18 @@ static bool IsNotInMeeting(const char* msg)
 
 **Note:** An earlier implementation looked for `"isInMeeting":true`, which Teams does not send. The correct field is `canLeave`.
 
+### Meeting name capture (v1.3)
+
+On each `canLeave: false → true` transition (call start), `CaptureMeetingName()` runs before `WM_APP_TEAMS_CALL_START` is posted. The Third-Party App API does not expose the meeting subject, so the name is scraped from the Teams window title via `EnumWindows`:
+
+1. **Format 1** — `"<Meeting Name> | Microsoft Teams"`: take the text before ` | Microsoft Teams`, dropping any extra ` | org | email` segments.
+2. **Format 2** — `"Microsoft Teams – <Meeting Name>"` (en-dash or hyphen): take the text after the prefix.
+3. **Fallback** — for 1:1 calls the title is just the contact name with no Teams marker, so any visible window owned by `ms-teams.exe` / `Teams.exe` (checked via `QueryFullProcessImageNameW`) supplies its title.
+
+The captured string is sanitized for use in a filename: truncated to 60 chars, illegal/space characters (`<>:"/\|?*` and space) replaced with `_`, runs of `_` collapsed, and leading/trailing `_` trimmed. The result is exposed via `TeamsGetMeetingName()`; `main.cpp` snapshots it into `g_callMeetingName` at `CALL_START` and uses it for every chunk filename of that call. Manual recordings leave it empty.
+
+All enumeration steps are written to `winrec_teams_log.txt` for diagnosis.
+
 ### Reconnection loop
 
 If Teams is not running, or the connection drops, the thread sleeps 5 seconds and retries indefinitely. When Teams starts, the connection is established automatically within ~5 seconds.
@@ -388,51 +401,7 @@ All connection events are written to `winrec_teams_log.txt` in the exe directory
 
 ---
 
-## 9. Component: Transcript Fetcher (transcript_fetcher.cpp)
-
-### Responsibility
-
-Runs in a persistent background thread for the entire lifetime of the application. Every 60 seconds it checks `gdrive:teams-audio/` for `.txt` transcript files produced by the Linux transcription app, copies them to the local OneDrive sync folder, and posts `WM_APP_TRANSCRIPT_FETCHED` to notify the main window.
-
-### Public API
-
-```cpp
-void TranscriptFetcherStart(HWND hwnd);
-void TranscriptFetcherStop();
-```
-
-### Motivation
-
-The Linux transcription app downloads WAV files from `gdrive:teams-audio/`, transcribes them, and uploads the resulting `.txt` file back to the same folder via `rclone copy`. The transcript fetcher closes this loop by retrieving those `.txt` files and depositing them in the OneDrive sync folder so Microsoft Copilot can index them for end-of-day summaries.
-
-### Destination path
-
-```
-C:\Users\jmitchiner\OneDrive - Pomeroy\Brian@Home\winrec\transcripts
-```
-
-The folder is created with `CreateDirectoryW` on the first check cycle (no-op if it already exists).
-
-### Check cycle
-
-On each cycle (and immediately at startup — the wait occurs at the *end* of the loop):
-
-1. **List:** run `rclone ls --include "*.txt" gdrive:teams-audio/` with stdout captured via a pipe.
-2. **Bail early:** if output is empty, skip to the wait — no rclone copy invoked.
-3. **Copy:** run `rclone copy --include "*.txt" gdrive:teams-audio/ "<dest>"`. Files remain on Drive until the pipeline is confirmed working; change `copy` to `move` when ready.
-4. **Notify:** post `WM_APP_TRANSCRIPT_FETCHED` with `wParam=1` on success, `wParam=0` on rclone error.
-
-### Stop mechanism
-
-Uses a manual-reset Windows Event (`CreateEventW`). `WaitForSingleObject(hStopEvent, 60000)` is used as the sleep so the thread wakes immediately when `TranscriptFetcherStop()` sets the event, rather than sleeping the full minute.
-
-### Error handling
-
-If `rclone.exe` is not found next to `winrec.exe`, `CreateProcessW` fails silently each cycle. The thread continues running — no crash, no user disruption, no interference with recording.
-
----
-
-## 10. Component: Main / State Coordinator (main.cpp)
+## 9. Component: Main / State Coordinator (main.cpp)
 
 ### Responsibility
 
@@ -440,30 +409,44 @@ If `rclone.exe` is not found next to `winrec.exe`, `CreateProcessW` fails silent
 - Runs `WinMain` and the Win32 message loop.
 - Orchestrates all state transitions in `HiddenWndProc`.
 - Spawns `NormalizerThread` and `UploaderThread` (capture.cpp handles its own thread).
+- Splits recordings into chunks and drives the per-chunk normalize/upload batch.
 
 ### Key globals
 
 ```cpp
-AppState     g_app  = {};   // current state, hwnd, file paths, timestamps
-std::wstring g_exeDir;      // set once at startup from GetModuleFileNameW
+AppState                g_app  = {};     // current state, hwnd, file paths, timestamps
+std::wstring            g_exeDir;        // set once at startup from GetModuleFileNameW
+std::wstring            g_callMeetingName;  // snapshot of TeamsGetMeetingName() at CALL_START
+bool                    g_isTeamsCall;   // distinguishes Teams call from manual recording
+std::vector<SplitChunk> g_chunks;        // pending chunks awaiting normalize+upload
+int                     g_normChunkIdx;  // index of chunk currently normalizing
+int                     g_uploadChunkIdx;// index of chunk currently uploading
 ```
+
+### Chunked recording pipeline (v1.3)
+
+Both manual and Teams recordings now share one pipeline. A `WM_TIMER` (`SPLIT_TIMER_ID`) fires every `SPLIT_INTERVAL_SECONDS` (2100 s ≈ 35 min) while `Recording`. On each fire — and on stop — the current capture is closed into a `SplitChunk` (raw path + start/end times + computed `outPath`), `g_chunks` grows, and capture restarts for the next chunk. `ComputeChunkOutPath()` builds `out\<start>-<end>[_<MeetingName>].wav`, appending `g_callMeetingName` when non-empty.
+
+When recording stops, the batch runs sequentially: normalize chunk 0 → upload chunk 0 → normalize chunk 1 → … Each `OnNormDone` advances `g_normChunkIdx`; once all chunks are normalized, uploads begin and `OnUploadDone` advances `g_uploadChunkIdx`, firing an "Upload complete: \<name\>" balloon per chunk. After the last upload, `g_chunks`, `g_isTeamsCall`, and `g_callMeetingName` reset and the app returns to Idle. Splitting bounds per-file size and memory, and keeps a single long meeting recoverable as discrete uploads.
 
 ### State transition handlers
 
 | Function | Transition | Trigger |
 |---|---|---|
-| `StartRecording()` | Idle → Recording | Left-click or `WM_APP_TEAMS_CALL_START` |
-| `StopRecording()` | Recording → (async) | Left-click or `WM_APP_TEAMS_CALL_END` |
-| `OnRecordingDone(ok)` | → Normalizing | `WM_APP_RECORDING_DONE` |
-| `OnNormDone(ok)` | → Uploading | `WM_APP_NORM_DONE` |
-| `OnUploadDone(ok)` | → Idle | `WM_APP_UPLOAD_DONE` |
-| `EnterIdle()` | → Idle | Error paths |
+| `StartRecording()` | Idle → Recording | Left-click or `WM_APP_TEAMS_CALL_START`; arms split timer |
+| `StopRecording()` | Recording → (async) | Left-click or `WM_APP_TEAMS_CALL_END`; closes final chunk |
+| `OnRecordingDone(ok)` | → batch normalize | `WM_APP_RECORDING_DONE` |
+| `OnNormDone(ok)` | → next chunk / Uploading | `WM_APP_NORM_DONE` |
+| `OnUploadDone(ok)` | → next chunk / Idle | `WM_APP_UPLOAD_DONE` |
+| `EnterIdle()` / `EnterError()` | → Idle / Error | Error paths |
 
 ### Teams auto-detection handlers
 
 ```cpp
 case WM_APP_TEAMS_CALL_START:
     if (g_app.state == RecorderState::Idle) {
+        g_callMeetingName = TeamsGetMeetingName();  // snapshot before next call clears it
+        g_isTeamsCall     = true;
         TrayBalloon(L"winrec – Teams", L"Call detected – recording started automatically.");
         StartRecording();
     }
@@ -488,7 +471,6 @@ g_exeDir = GetExeDir();
 g_app.state = RecorderState::Idle;
 TrayAdd(g_app.hwnd);
 TeamsMonitorStart(g_app.hwnd);
-TranscriptFetcherStart(g_app.hwnd);
 // Enter message loop
 ```
 
@@ -501,13 +483,12 @@ TrayRemove();
 PostQuitMessage(0);
 // After message loop:
 TeamsMonitorStop();
-TranscriptFetcherStop();
 CoUninitialize();
 ```
 
 ---
 
-## 11. Message Protocol
+## 10. Message Protocol
 
 All inter-thread communication goes through `PostMessageW` to the main hidden window.
 
@@ -519,13 +500,12 @@ All inter-thread communication goes through `PostMessageW` to the main hidden wi
 | `WM_APP_UPLOAD_DONE` | `WM_USER+4` | uploader thread | 0=ok, 1=err | Upload complete |
 | `WM_APP_TEAMS_CALL_START` | `WM_USER+5` | Teams monitor thread | — | Call/meeting joined |
 | `WM_APP_TEAMS_CALL_END` | `WM_USER+6` | Teams monitor thread | — | Call/meeting left |
-| `WM_APP_TRANSCRIPT_FETCHED` | `WM_USER+7` | Transcript fetcher thread | 1=ok, 0=err | .txt files copied to OneDrive |
 
 Using `PostMessageW` (not `SendMessageW`) ensures background threads never block on the main thread.
 
 ---
 
-## 12. File Layout and Naming
+## 11. File Layout and Naming
 
 ### Runtime files
 
@@ -537,11 +517,12 @@ Using `PostMessageW` (not `SendMessageW`) ensures background threads never block
     winrec_teams_log.txt        Teams connection debug log (appended each run)
     rclone_log.txt              Upload rclone log (deleted on success)
     tmp\
-        raw_YYMMDD_HHMM.pcm    Raw 16-bit mono PCM at device sample rate
-        raw_YYMMDD_HHMM.tmp    Resampled float buffer (pass 1 of normalizer)
+        raw_YYMMDD_HHMM.pcm    Raw 16-bit mono PCM at device sample rate (deleted after resample)
     out\
-        YYMMDD_HHMM-YYMMDD_HHMM.wav   Final normalized 16 kHz mono WAV
+        YYMMDD_HHMM-YYMMDD_HHMM[_Meeting].wav   16 kHz mono WAV (deleted after upload)
 ```
+
+The intermediate `.tmp` float buffer no longer exists — the normalizer is single-pass (see §6).
 
 ### Timestamp format
 
@@ -549,13 +530,23 @@ Using `PostMessageW` (not `SendMessageW`) ensures background threads never block
 
 Example: 14:30 on 8 March 2026 → `260308_1430`.
 
-File name: `<start>-<end>.wav` → `260308_1430-260308_1512.wav`.
+### Output filename
+
+`ComputeChunkOutPath(start, end)` builds:
+
+```
+<start>-<end>[_<MeetingName>].wav
+```
+
+- Manual recording: `260308_1430-260308_1512.wav`.
+- Teams call: `260308_1430-260308_1512_Weekly_Sync.wav` — the sanitized meeting name (see §8) is appended after an underscore.
+- A long recording produces several files, one per ~35-min chunk, each with its own start/end stamp and (for Teams) the same meeting name.
 
 Colons are excluded from filenames because Windows does not allow them in paths.
 
 ---
 
-## 13. Audio Capture Details
+## 12. Audio Capture Details
 
 ### WASAPI path — format handling
 
@@ -591,7 +582,7 @@ A simple circular buffer of `int16_t` samples, protected by a `CRITICAL_SECTION`
 
 ---
 
-## 14. Build System
+## 13. Build System
 
 ### Makefile
 
@@ -610,8 +601,7 @@ LIBS := -lole32 -loleaut32 -luuid \
         -lmmdevapi -lwinmm -lwinhttp
 
 SRCS := src/main.cpp src/tray.cpp src/capture.cpp \
-        src/normalizer.cpp src/uploader.cpp src/teams.cpp \
-        src/transcript_fetcher.cpp
+        src/normalizer.cpp src/uploader.cpp src/teams.cpp
 ```
 
 ### Library requirements
@@ -637,7 +627,7 @@ Output: `winrec.exe` in the project root.
 
 ---
 
-## 15. Key Design Decisions
+## 14. Key Design Decisions
 
 ### No main window
 
@@ -669,13 +659,13 @@ The token is generated once with `CoCreateGuid` and saved to `winrec_teams_token
 
 ---
 
-## 16. Known Issues and Limitations
+## 15. Known Issues and Limitations
 
 | Issue | Detail |
 |---|---|
 | No Stereo Mix on Bluetooth/USB headsets | Hardware limitation; workaround is to use laptop speakers as Teams audio output |
 | WASAPI loopback blocked by corporate DLP | WaveIn fallback partially mitigates this |
-| No per-device volume control | Fixed 50/50 mix; normalization corrects amplitude but not balance |
+| No per-device volume control | Fixed 50/50 mix; no gain correction is applied (normalization was removed in v1.3) |
 | Linear interpolation aliasing | Inaudible for speech; would require a polyphase FIR filter to fix |
 | rclone reconnect requires browser | Cannot work in headless/locked sessions; user must be present |
 | Teams Third-Party App API policy | Some organizations disable this setting; auto-detection unavailable in those cases |

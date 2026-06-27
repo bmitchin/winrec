@@ -32,7 +32,7 @@ A 1-hour Teams call produces a file of roughly 115 MB.
 
 ### Amplitude
 
-winrec normalizes each file to **95% of full scale** (peak amplitude = 0.95). Files are never silent and never clipped. No further normalization or gain adjustment is needed before transcription.
+**As of winrec v1.3, no peak normalization is applied.** Files are written at their captured level (samples are clamped to full scale but not rescaled). Levels may therefore vary between recordings depending on system and mic volume. This is fine for the major speech-to-text engines, which are robust to moderate level variation; if a downstream tool needs a consistent level, normalize on the transcription side. (Earlier winrec versions normalized to 0.95 peak — do not assume that any longer.)
 
 ### Content
 
@@ -40,20 +40,27 @@ The file contains a **mono mix** of:
 - **System audio (loopback):** everything audible through the laptop speakers during the call — remote participants, shared video, hold music.
 - **Microphone:** the local speaker's voice.
 
-Both are mixed at equal weight (50/50) before normalization. All participants are on a single track — there is no speaker separation or channel splitting.
+Both are mixed at equal weight (50/50). All participants are on a single track — there is no speaker separation or channel splitting.
 
 ### Filename format
 
 ```
-YYMMDD_HHMM-YYMMDD_HHMM.wav
+YYMMDD_HHMM-YYMMDD_HHMM[_MeetingName].wav
+│      │         │            └─ Teams meeting name (Teams calls only; omitted for manual recordings)
 │      │         └─ stop  time (local, 24-hour, YYMMDD_HHMM)
 │      └─────────── start time
 └────────────────── two-digit year
 ```
 
-Example: `260308_1430-260308_1512.wav` — recorded 8 March 2026, 14:30 to 15:12.
+Examples:
+- `260308_1430-260308_1512.wav` — a manual recording, 8 March 2026, 14:30 to 15:12.
+- `260308_1430-260308_1512_Weekly_Team_Sync.wav` — a Teams call tagged with the meeting name.
 
-The filename gives exact start and end times, useful for correlating recordings with calendar entries.
+The leading `YYMMDD_HHMM-YYMMDD_HHMM` portion is always present and gives exact start and end times. An optional `_<MeetingName>` suffix follows for Teams-detected calls: it is the Teams window title, sanitized (illegal/space characters → `_`, collapsed, truncated to 60 chars), so it may contain underscores and is not guaranteed unique.
+
+**Parsing tip:** match the timestamps with a prefix pattern such as `^(\d{6}_\d{4})-(\d{6}_\d{4})(?:_(.*))?\.wav$` rather than splitting on `_`, since the meeting name itself contains underscores.
+
+**Chunking:** recordings longer than ~35 minutes are split by winrec into multiple files, each with its own start/end timestamps (and, for Teams calls, the same meeting name). A single long meeting may therefore arrive as several sequential WAVs.
 
 ### Google Drive location
 
@@ -251,9 +258,10 @@ Then copy the updated `rclone.conf` to the other machine, or re-run the reconnec
 ## 4. Summary Checklist for the Transcription App
 
 - [ ] WAV files are **16 kHz, mono, 16-bit PCM** — pass directly to STT API with no conversion.
-- [ ] Files appear in `gdrive:teams-audio/` after each recording.
+- [ ] Levels are **not normalized** (v1.3+) — normalize on the transcription side if a tool needs it.
+- [ ] Files appear in `gdrive:teams-audio/` after each recording; long calls arrive as several ~35-min chunks.
 - [ ] Use `rclone lsf gdrive:teams-audio/` to list available files.
 - [ ] Use `rclone copy` or `rclone move` to download files.
-- [ ] Filename encodes start and end time: `YYMMDD_HHMM-YYMMDD_HHMM.wav`.
+- [ ] Filename encodes start and end time, with an optional meeting name: `YYMMDD_HHMM-YYMMDD_HHMM[_MeetingName].wav`. Parse timestamps by prefix, not by splitting on `_`.
 - [ ] No separate Google authorization needed — reuse the existing `rclone.conf`.
 - [ ] After transcription, remove or archive the file from Drive to avoid reprocessing.
