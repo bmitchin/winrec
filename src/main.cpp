@@ -263,7 +263,7 @@ static void OnNormDone(bool ok)
         g_uploadChunkIdx = 0;
         std::wstring rclonePath = g_exeDir + L"\\rclone.exe";
         auto* p = new UploadParams{
-            g_chunks[0].outPath, rclonePath, L"gdrive:teams-audio/", g_app.hwnd
+            g_chunks[0].outPath, rclonePath, REMOTE_FOLDER, g_app.hwnd
         };
         HANDLE h = CreateThread(nullptr, 0, UploaderThread, p, 0, nullptr);
         if (h) CloseHandle(h);
@@ -292,7 +292,7 @@ static void OnUploadDone(bool ok)
             std::wstring rclonePath = g_exeDir + L"\\rclone.exe";
             auto* p = new UploadParams{
                 g_chunks[g_uploadChunkIdx].outPath, rclonePath,
-                L"gdrive:teams-audio/", g_app.hwnd
+                REMOTE_FOLDER, g_app.hwnd
             };
             HANDLE h = CreateThread(nullptr, 0, UploaderThread, p, 0, nullptr);
             if (h) CloseHandle(h);
