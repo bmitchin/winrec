@@ -34,11 +34,12 @@ constexpr int SPLIT_INTERVAL_SECONDS = 2100;  // ~35 min per chunk
 
 // ---------------------------------------------------------------------------
 // Upload target — single knob for the rclone remote folder.
-// v2 builds override this to a quarantined folder so test uploads never land
-// in the live folder the transcription project consumes.
+// v2 quarantine: test uploads go here, NOT the live "gdrive:teams-audio/"
+// folder the transcription project consumes. Flip back only when v2 ships and
+// the transcription side has been updated in lockstep.
 // ---------------------------------------------------------------------------
 
-constexpr const wchar_t* REMOTE_FOLDER = L"gdrive:teams-audio/";
+constexpr const wchar_t* REMOTE_FOLDER = L"gdrive:teams-audio-v2/";
 
 struct SplitChunk {
     std::wstring rawPath;
